@@ -36,15 +36,15 @@ services:
       retries: 5
 
   kafka-ui:
-    image: obsidiandynamics/kafdrop:latest
+    image: provectuslabs/kafka-ui:latest
     container_name: mlviz-kafka-ui
     depends_on:
       - kafka
     ports:
-      - "8080:9000"
+      - "8081:8080"
     environment:
-      KAFKA_BROKERCONNECT: kafka:9092
-      JVM_OPTS: "-Xms32M -Xmx64M"
+      KAFKA_CLUSTERS_0_NAME: local
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092
     networks:
       - mlviz-network
 

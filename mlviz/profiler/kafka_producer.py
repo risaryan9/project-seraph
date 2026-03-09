@@ -48,7 +48,6 @@ class MetricProducer:
                 retries=2,
                 max_in_flight_requests_per_connection=5,
                 linger_ms=10,
-                compression_type="snappy",
             )
             logger.info(f"Kafka producer initialized: {broker}")
         except KafkaError as e:
