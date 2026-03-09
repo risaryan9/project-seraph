@@ -1,5 +1,6 @@
 """MLViz Agent for collecting hardware metrics in model processes."""
 
+import logging
 import os
 import platform
 import queue
@@ -13,6 +14,9 @@ import psutil
 from dotenv import load_dotenv
 
 from .metrics import MetricSample
+from .kafka_producer import get_producer
+
+logger = logging.getLogger(__name__)
 
 
 class MLVizAgent:
@@ -44,6 +48,16 @@ class MLVizAgent:
         self._throughput = -1.0
         self._sample_queue: queue.Queue = queue.Queue()
         self._stop_event = threading.Event()
+        self._kafka_enabled = os.getenv("KAFKA_ENABLED", "true").lower() == "true"
+        
+        if self._kafka_enabled:
+            try:
+                self._kafka_producer = get_producer()
+            except Exception as e:
+                logger.warning(f"Kafka producer init failed: {e}")
+                self._kafka_producer = None
+        else:
+            self._kafka_producer = None
         
         try:
             self._process = psutil.Process(os.getpid())
@@ -96,6 +110,12 @@ class MLVizAgent:
                 sample = self._collect_sample()
                 if sample:
                     self._sample_queue.put(sample)
+                    
+                    if self._kafka_producer:
+                        try:
+                            self._kafka_producer.send_metric(self.model_id, sample)
+                        except Exception as e:
+                            logger.debug(f"Kafka send failed: {e}")
             except Exception:
                 pass
             
@@ -301,7 +321,13 @@ class MLVizAgent:
         return samples
     
     def stop(self):
-        """Stop the background collection thread."""
+        """Stop the background collection thread and flush Kafka."""
         self._stop_event.set()
         if self._collector_thread.is_alive():
             self._collector_thread.join(timeout=2.0)
+        
+        if self._kafka_producer:
+            try:
+                self._kafka_producer.flush()
+            except Exception:
+                pass

@@ -1,7 +1,9 @@
 """Core data structure for hardware metrics."""
 
-from dataclasses import dataclass
+import json
+from dataclasses import asdict, dataclass
 from datetime import datetime
+from typing import Dict
 
 
 @dataclass
@@ -71,3 +73,47 @@ class MetricSample:
             f"LLC: {llc_str:>5} | Tput: {tput_str:>9} | "
             f"Phase: {self.phase_duration_ms:.0f}ms"
         )
+    
+    def to_dict(self) -> Dict:
+        """
+        Convert MetricSample to a JSON-serializable dictionary.
+        
+        Returns:
+            Dictionary with all fields as JSON-compatible types.
+        """
+        return asdict(self)
+    
+    def to_json(self) -> str:
+        """
+        Serialize MetricSample to JSON string.
+        
+        Returns:
+            JSON string representation of the sample.
+        """
+        return json.dumps(self.to_dict())
+    
+    @classmethod
+    def from_dict(cls, data: Dict) -> "MetricSample":
+        """
+        Deserialize MetricSample from a dictionary.
+        
+        Args:
+            data: Dictionary with MetricSample fields.
+            
+        Returns:
+            MetricSample instance.
+        """
+        return cls(**data)
+    
+    @classmethod
+    def from_json(cls, json_str: str) -> "MetricSample":
+        """
+        Deserialize MetricSample from JSON string.
+        
+        Args:
+            json_str: JSON string representation.
+            
+        Returns:
+            MetricSample instance.
+        """
+        return cls.from_dict(json.loads(json_str))
