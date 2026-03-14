@@ -165,6 +165,23 @@ services:
       - mlviz-network
     tty: true
 
+  backend:
+    build: .
+    container_name: mlviz-backend
+    depends_on:
+      influxdb:
+        condition: service_healthy
+    environment:
+      INFLUX_URL: http://influxdb:8086
+      INFLUX_TOKEN: mlviz-dev-token
+      INFLUX_ORG: mlviz
+      INFLUX_BUCKET: metrics
+    command: uvicorn mlviz.api.main:app --host 0.0.0.0 --port 8000
+    ports:
+      - "8000:8000"
+    networks:
+      - mlviz-network
+
 networks:
   mlviz-network:
     driver: bridge

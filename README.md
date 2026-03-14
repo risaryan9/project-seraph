@@ -28,9 +28,11 @@ This will:
 3. Bootstrap topics with 3 partitions each
 4. Launch 3 ML workload simulations (resnet18-train, distilbert-infer, data-pipeline)
 5. Start the aggregator service (writes to InfluxDB in batches)
-6. Start the live-view service (colored terminal output)
-7. Start Kafka UI at http://localhost:8081
-8. Start InfluxDB UI at http://localhost:8086
+6. Start the FastAPI backend (queries InfluxDB via REST)
+7. Start the live-view service (colored terminal output)
+8. Start Kafka UI at http://localhost:8081
+9. Start InfluxDB UI at http://localhost:8086
+10. Start FastAPI at http://localhost:8000 (docs at http://localhost:8000/docs)
 
 ### Viewing Metrics
 
@@ -56,6 +58,28 @@ Open http://localhost:8086 in your browser to:
 - Query the `metrics` bucket
 - View time-series data in the Data Explorer
 - See all metrics tagged by `model_id` and `phase`
+
+**Option 5 — FastAPI REST API:**
+Open http://localhost:8000/docs in your browser to:
+- View interactive API documentation (Swagger UI)
+- Test endpoints directly in the browser
+- Query metrics with flexible time ranges and filters
+- Export OpenAPI spec for Postman
+
+Example API calls:
+```bash
+# Get raw metrics for the last 15 minutes
+curl "http://localhost:8000/api/metrics/raw?start_relative=-15m&limit=100"
+
+# Get aggregated CPU metrics (30s windows, mean)
+curl "http://localhost:8000/api/metrics/aggregate?window=30s&aggregation=mean&fields=cpu_percent"
+
+# List all models
+curl "http://localhost:8000/api/models"
+
+# List phases for a specific model
+curl "http://localhost:8000/api/phases?model_id=resnet18-train"
+```
 
 ### Stopping
 
@@ -148,9 +172,13 @@ python -m mlviz.live_view.service
              │ (50 samples or 500ms)
              ▼
        ┌──────────┐
-       │ InfluxDB │
-       │ (metrics)│
-       └──────────┘
+       │ InfluxDB │◄──── query ────┐
+       │ (metrics)│                │
+       └──────────┘                │
+                            ┌──────┴────┐
+                            │  FastAPI  │
+                            │  Backend  │
+                            └───────────┘
 ```
 
 ### Key Components
@@ -160,6 +188,7 @@ python -m mlviz.live_view.service
 - **Kafka**: Message broker with topics `metrics.{model_id}` (3 partitions each).
 - **Aggregator**: Consumer group `mlviz-aggregator` that writes metrics to InfluxDB in batches (50 samples or 500ms).
 - **InfluxDB**: Time-series database storing all metrics with tags (`model_id`, `phase`) and 13 metric fields.
+- **FastAPI Backend**: REST API for querying InfluxDB with flexible time ranges, filters, and aggregations.
 - **Live-View**: Consumer group `mlviz-live-view` for real-time terminal display.
 - **Kafka UI**: Web interface for inspecting topics, partitions, and messages.
 
@@ -207,8 +236,9 @@ Each `MetricSample` contains:
 ## Next Steps
 
 - [x] Add InfluxDB for time-series storage
+- [x] Add FastAPI backend with REST endpoints
 - [ ] Implement anomaly detection and alerts
-- [ ] Add FastAPI backend with WebSocket support
+- [ ] Add WebSocket support to FastAPI for real-time streaming
 - [ ] Build React dashboard with Recharts
 - [ ] Add interference score calculation
 - [ ] Implement Kubernetes deployment manifests
