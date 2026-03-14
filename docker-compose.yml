@@ -48,6 +48,28 @@ services:
     networks:
       - mlviz-network
 
+  influxdb:
+    image: influxdb:2.7
+    container_name: mlviz-influxdb
+    ports:
+      - "8086:8086"
+    environment:
+      DOCKER_INFLUXDB_INIT_MODE: setup
+      DOCKER_INFLUXDB_INIT_ORG: mlviz
+      DOCKER_INFLUXDB_INIT_BUCKET: metrics
+      DOCKER_INFLUXDB_INIT_USERNAME: admin
+      DOCKER_INFLUXDB_INIT_PASSWORD: mlviz-admin-password
+      DOCKER_INFLUXDB_INIT_ADMIN_TOKEN: mlviz-dev-token
+    networks:
+      - mlviz-network
+    volumes:
+      - influxdb-data:/var/lib/influxdb2
+    healthcheck:
+      test: ["CMD", "influx", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
   topic-bootstrap:
     build: .
     container_name: mlviz-topic-bootstrap
@@ -118,8 +140,14 @@ services:
     depends_on:
       kafka:
         condition: service_healthy
+      influxdb:
+        condition: service_healthy
     environment:
       KAFKA_BROKER: kafka:9092
+      INFLUX_URL: http://influxdb:8086
+      INFLUX_TOKEN: mlviz-dev-token
+      INFLUX_ORG: mlviz
+      INFLUX_BUCKET: metrics
     command: python -m mlviz.aggregator.service
     networks:
       - mlviz-network
@@ -140,3 +168,6 @@ services:
 networks:
   mlviz-network:
     driver: bridge
+
+volumes:
+  influxdb-data:

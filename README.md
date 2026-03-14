@@ -16,7 +16,7 @@ A cloud-native, distributed hardware resource monitoring framework for concurren
 
 ### Running with Docker (Recommended)
 
-Start the entire stack (Kafka, Zookeeper, Kafka UI, 3 workloads, aggregator, live-view):
+Start the entire stack (Kafka, Zookeeper, InfluxDB, Kafka UI, 3 workloads, aggregator, live-view):
 
 ```bash
 docker-compose up --build
@@ -24,11 +24,13 @@ docker-compose up --build
 
 This will:
 1. Start Zookeeper and Kafka
-2. Bootstrap topics with 3 partitions each
-3. Launch 3 ML workload simulations (resnet18-train, distilbert-infer, data-pipeline)
-4. Start the aggregator service (logs to container output)
-5. Start the live-view service (colored terminal output)
-6. Start Kafka UI at http://localhost:8080
+2. Start InfluxDB with auto-configured org, bucket, and token
+3. Bootstrap topics with 3 partitions each
+4. Launch 3 ML workload simulations (resnet18-train, distilbert-infer, data-pipeline)
+5. Start the aggregator service (writes to InfluxDB in batches)
+6. Start the live-view service (colored terminal output)
+7. Start Kafka UI at http://localhost:8081
+8. Start InfluxDB UI at http://localhost:8086
 
 ### Viewing Metrics
 
@@ -43,10 +45,17 @@ docker-compose logs -f aggregator
 ```
 
 **Option 3 — Kafka UI:**
-Open http://localhost:8080 in your browser to:
+Open http://localhost:8081 in your browser to:
 - Browse topics (`metrics.resnet18-train`, `metrics.distilbert-infer`, `metrics.data-pipeline`)
 - View messages in real-time
 - Inspect partitions and consumer groups
+
+**Option 4 — InfluxDB UI:**
+Open http://localhost:8086 in your browser to:
+- Log in with username `admin` and password `mlviz-admin-password`
+- Query the `metrics` bucket
+- View time-series data in the Data Explorer
+- See all metrics tagged by `model_id` and `phase`
 
 ### Stopping
 
@@ -133,7 +142,15 @@ python -m mlviz.live_view.service
        ┌──────────┐  ┌──────────┐  ┌──────────┐
        │Aggregator│  │Live-View │  │ Kafka UI │
        │(group A) │  │(group B) │  │ (browse) │
-       └──────────┘  └──────────┘  └──────────┘
+       └─────┬────┘  └──────────┘  └──────────┘
+             │
+             │ batch write
+             │ (50 samples or 500ms)
+             ▼
+       ┌──────────┐
+       │ InfluxDB │
+       │ (metrics)│
+       └──────────┘
 ```
 
 ### Key Components
@@ -141,7 +158,8 @@ python -m mlviz.live_view.service
 - **MLViz Agent**: Runs in each workload process; collects hardware metrics every 150ms and produces to Kafka.
 - **Workloads**: Three simulated ML models (ResNet training, DistilBERT inference, data pipeline).
 - **Kafka**: Message broker with topics `metrics.{model_id}` (3 partitions each).
-- **Aggregator**: Consumer group `mlviz-aggregator` for long-term processing (later: InfluxDB writes, alerts).
+- **Aggregator**: Consumer group `mlviz-aggregator` that writes metrics to InfluxDB in batches (50 samples or 500ms).
+- **InfluxDB**: Time-series database storing all metrics with tags (`model_id`, `phase`) and 13 metric fields.
 - **Live-View**: Consumer group `mlviz-live-view` for real-time terminal display.
 - **Kafka UI**: Web interface for inspecting topics, partitions, and messages.
 
@@ -152,10 +170,19 @@ python -m mlviz.live_view.service
 Edit `.env` to configure:
 
 ```bash
+# Workload configuration
 SAMPLE_INTERVAL_MS=150      # Metric collection interval
 RUN_SECONDS=300             # How long workloads run
+
+# Kafka configuration
 KAFKA_BROKER=localhost:9092 # Kafka address (kafka:9092 in Docker)
 KAFKA_ENABLED=true          # Enable/disable Kafka (use false for local queue-only mode)
+
+# InfluxDB configuration (aggregator only)
+INFLUX_URL=http://localhost:8086  # InfluxDB address (http://influxdb:8086 in Docker)
+INFLUX_TOKEN=mlviz-dev-token      # Admin token
+INFLUX_ORG=mlviz                  # Organization name
+INFLUX_BUCKET=metrics             # Bucket name
 ```
 
 ---
@@ -179,7 +206,7 @@ Each `MetricSample` contains:
 
 ## Next Steps
 
-- [ ] Add InfluxDB for time-series storage
+- [x] Add InfluxDB for time-series storage
 - [ ] Implement anomaly detection and alerts
 - [ ] Add FastAPI backend with WebSocket support
 - [ ] Build React dashboard with Recharts
