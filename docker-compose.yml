@@ -171,7 +171,10 @@ services:
     depends_on:
       influxdb:
         condition: service_healthy
+      kafka:
+        condition: service_healthy
     environment:
+      KAFKA_BROKER: kafka:9092
       INFLUX_URL: http://influxdb:8086
       INFLUX_TOKEN: mlviz-dev-token
       INFLUX_ORG: mlviz

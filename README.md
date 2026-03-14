@@ -81,6 +81,22 @@ curl "http://localhost:8000/api/models"
 curl "http://localhost:8000/api/phases?model_id=resnet18-train"
 ```
 
+**Option 6 — WebSocket Live Stream:**
+Connect to `ws://localhost:8000/ws/live` for real-time metrics:
+- **Postman**: Create a WebSocket request to `ws://localhost:8000/ws/live`
+- **Browser Console**:
+  ```javascript
+  const ws = new WebSocket('ws://localhost:8000/ws/live');
+  ws.onmessage = (e) => console.log(JSON.parse(e.data));
+  ```
+- **Python**:
+  ```bash
+  pip install websockets
+  python -c "import asyncio, websockets, json; asyncio.run((lambda: websockets.connect('ws://localhost:8000/ws/live')).__await__())"
+  ```
+
+Each message is a complete MetricSample JSON with all hardware metrics. Perfect for real-time dashboards!
+
 ### Stopping
 
 ```bash
@@ -237,8 +253,8 @@ Each `MetricSample` contains:
 
 - [x] Add InfluxDB for time-series storage
 - [x] Add FastAPI backend with REST endpoints
+- [x] Add WebSocket support to FastAPI for real-time streaming
 - [ ] Implement anomaly detection and alerts
-- [ ] Add WebSocket support to FastAPI for real-time streaming
 - [ ] Build React dashboard with Recharts
 - [ ] Add interference score calculation
 - [ ] Implement Kubernetes deployment manifests

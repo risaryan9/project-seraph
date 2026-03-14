@@ -508,9 +508,167 @@ curl "http://localhost:8000/api/metrics/raw?start_relative=-24h&limit=10"
 
 ---
 
+## WebSocket Live Streaming
+
+### `WS /ws/live`
+Real-time metrics streaming via WebSocket.
+
+**URL:** `ws://localhost:8000/ws/live`
+
+**Description:**  
+Connect to this WebSocket endpoint to receive live metric samples as they are produced by workloads and consumed from Kafka. Each message is pushed to all connected clients with sub-100ms latency.
+
+**Message Format:**  
+Each message is a JSON object with all MetricSample fields:
+
+```json
+{
+  "timestamp": 1710374567890.123,
+  "model_id": "resnet18-train",
+  "phase": "forward",
+  "cpu_percent": 45.2,
+  "cpu_system": 23.5,
+  "ram_mb": 1024.5,
+  "ram_system_pct": 45.8,
+  "io_read_mb": 12.3,
+  "io_write_mb": 5.6,
+  "thread_count": 8,
+  "page_faults_minor": 150,
+  "page_faults_major": 2,
+  "voluntary_ctx_switches": 45,
+  "llc_miss_rate": 0.15,
+  "throughput": 32.5,
+  "phase_duration_ms": 125.3
+}
+```
+
+**Connection Message:**  
+Upon successful connection, the server sends a welcome message:
+
+```json
+{
+  "type": "connected",
+  "message": "Live metrics stream connected"
+}
+```
+
+### Testing with Postman
+
+1. **Create WebSocket Request**:
+   - In Postman, click **New** → **WebSocket Request**
+   - Or change an existing request type to **WebSocket**
+
+2. **Enter URL**:
+   ```
+   ws://localhost:8000/ws/live
+   ```
+
+3. **Connect**:
+   - Click **Connect** button
+   - You should see "Connected" status and the welcome message
+
+4. **Receive Messages**:
+   - Live metric samples will appear in the **Messages** pane
+   - Each message is a complete MetricSample JSON object
+   - Messages arrive every ~150ms (3 workloads × ~50ms each)
+
+5. **Monitor**:
+   - Messages are color-coded by direction (received = green)
+   - You can filter messages or search for specific model_id/phase
+   - The timestamp shows when each message was received
+
+6. **Disconnect**:
+   - Click **Disconnect** to close the WebSocket connection
+
+### Testing with curl (wscat)
+
+Install wscat if needed:
+```bash
+npm install -g wscat
+```
+
+Connect and receive messages:
+```bash
+wscat -c ws://localhost:8000/ws/live
+```
+
+Press Ctrl+C to disconnect.
+
+### Testing with Python
+
+```python
+import asyncio
+import websockets
+import json
+
+async def receive_metrics():
+    uri = "ws://localhost:8000/ws/live"
+    async with websockets.connect(uri) as websocket:
+        print("Connected to live metrics stream")
+        
+        while True:
+            message = await websocket.recv()
+            data = json.loads(message)
+            
+            if data.get("type") == "connected":
+                print(f"Server: {data['message']}")
+            else:
+                print(f"[{data['model_id']}] {data['phase']}: CPU={data['cpu_percent']:.1f}%")
+
+asyncio.run(receive_metrics())
+```
+
+### Testing with JavaScript (Browser)
+
+```javascript
+const ws = new WebSocket('ws://localhost:8000/ws/live');
+
+ws.onopen = () => {
+  console.log('Connected to live metrics stream');
+};
+
+ws.onmessage = (event) => {
+  const data = JSON.parse(event.data);
+  
+  if (data.type === 'connected') {
+    console.log('Server:', data.message);
+  } else {
+    console.log(`[${data.model_id}] ${data.phase}: CPU=${data.cpu_percent.toFixed(1)}%`);
+  }
+};
+
+ws.onerror = (error) => {
+  console.error('WebSocket error:', error);
+};
+
+ws.onclose = () => {
+  console.log('Disconnected from live metrics stream');
+};
+```
+
+### Troubleshooting
+
+**No messages received:**
+1. Verify workloads are running: `docker compose ps`
+2. Check backend logs: `docker compose logs backend`
+3. Confirm Kafka is healthy: `docker compose logs kafka`
+4. Verify metrics are being produced: `docker compose logs aggregator | grep Flushed`
+
+**Connection refused:**
+- Ensure backend is running on port 8000
+- Check firewall settings
+- Verify URL uses `ws://` not `wss://` (no TLS in dev)
+
+**Messages stop flowing:**
+- Workloads may have finished (default 300s runtime)
+- Restart stack: `docker compose restart`
+- Check for Kafka consumer errors in backend logs
+
+---
+
 ## Next Steps
 
-- Add WebSocket endpoint for real-time streaming
 - Implement authentication/API keys
 - Add rate limiting
-- Build React dashboard that consumes these endpoints
+- Build React dashboard that consumes WebSocket and REST endpoints
+- Add reconnection logic for production use
