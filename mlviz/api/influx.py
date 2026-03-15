@@ -282,6 +282,98 @@ from(bucket: "{self.bucket}")
             logger.error(f"Query failed: {e}")
             raise
     
+    def query_total_count(
+        self,
+        start_relative: str = "-24h",
+        start: Optional[str] = None,
+        end: Optional[str] = None
+    ) -> int:
+        """
+        Get total count of metric records in InfluxDB for the time range.
+        Each hardware sample writes multiple records (one per field); this returns
+        the total record count. For approximate sample count, divide by len(METRIC_FIELDS).
+        """
+        time_range = self.build_time_range(start_relative, start, end)
+        flux_query = f'''
+from(bucket: "{self.bucket}")
+  |> {time_range}
+  |> filter(fn: (r) => r._measurement == "hardware_sample")
+  |> group()
+  |> count()
+'''
+        try:
+            tables = self.query_api.query(flux_query)
+            for table in tables:
+                for record in table.records:
+                    val = record.get_value()
+                    if val is not None:
+                        return int(val)
+            return 0
+        except Exception as e:
+            logger.error(f"Count query failed: {e}")
+            raise
+
+    def query_recent_samples(
+        self,
+        start_relative: str = "-2m",
+        limit: int = 3000
+    ) -> List[Dict]:
+        """
+        Query recent raw metrics and pivot into one dict per (timestamp, model_id, phase)
+        with all field values. Returns list of MetricSample-like dicts for dashboard use.
+        """
+        raw = self.query_raw(
+            start_relative=start_relative,
+            fields=None,
+            limit=limit
+        )
+        # Pivot: group by (timestamp, model_id, phase)
+        from collections import defaultdict
+        from datetime import datetime
+        groups = defaultdict(dict)
+        for r in raw:
+            ts = r["timestamp"]
+            model_id = r.get("model_id") or ""
+            phase = r.get("phase") or "idle"
+            key = (ts, model_id, phase)
+            if key not in groups:
+                try:
+                    dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+                    groups[key]["timestamp"] = int(dt.timestamp() * 1000)
+                except Exception:
+                    groups[key]["timestamp"] = 0
+                groups[key]["model_id"] = model_id
+                groups[key]["phase"] = phase
+            field = r.get("field")
+            value = r.get("value")
+            if field is not None and value is not None:
+                groups[key][field] = value
+
+        # Build list with all numeric fields, use 0 or -1 for missing
+        result = []
+        for key, d in groups.items():
+            row = {
+                "timestamp": d["timestamp"],
+                "model_id": d["model_id"],
+                "phase": d["phase"],
+                "cpu_percent": d.get("cpu_percent", 0.0),
+                "cpu_system": d.get("cpu_system", 0.0),
+                "ram_mb": d.get("ram_mb", 0.0),
+                "ram_system_pct": d.get("ram_system_pct", 0.0),
+                "io_read_mb": d.get("io_read_mb", 0.0),
+                "io_write_mb": d.get("io_write_mb", 0.0),
+                "thread_count": int(d.get("thread_count", 0)),
+                "page_faults_minor": int(d.get("page_faults_minor", 0)),
+                "page_faults_major": int(d.get("page_faults_major", 0)),
+                "voluntary_ctx_switches": int(d.get("voluntary_ctx_switches", 0)),
+                "llc_miss_rate": d.get("llc_miss_rate", -1.0),
+                "throughput": d.get("throughput", -1.0),
+                "phase_duration_ms": d.get("phase_duration_ms", 0.0),
+            }
+            result.append(row)
+        result.sort(key=lambda x: x["timestamp"])
+        return result
+
     def _parse_tables(self, tables) -> List[Dict]:
         """
         Parse InfluxDB query result tables into list of dicts.

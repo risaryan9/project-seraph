@@ -243,6 +243,54 @@ async def get_phases(
         )
 
 
+@router.get("/metrics/count")
+async def get_metrics_count(
+    start_relative: Optional[str] = Query(
+        default="-24h",
+        description="Time range for count (e.g. '-1h', '-24h')"
+    )
+):
+    """
+    Get total count of metric records in InfluxDB for the time range.
+    Used by the dashboard for 'Samples Collected' (poll every 5-10s).
+    """
+    try:
+        count = influx_helper.query_total_count(start_relative=start_relative)
+        return {"count": count}
+    except Exception as e:
+        logger.error(f"Failed to get metrics count: {e}")
+        raise HTTPException(
+            status_code=502,
+            detail=f"InfluxDB query failed: {str(e)}"
+        )
+
+
+@router.get("/metrics/recent")
+async def get_recent_samples(
+    start_relative: Optional[str] = Query(
+        default="-2m",
+        description="Time range (e.g. '-1m', '-2m')"
+    ),
+    limit: int = Query(default=2000, ge=100, le=5000, description="Max raw records (≈samples*14)")
+):
+    """
+    Get recent metric samples in dashboard format (one object per sample with all fields).
+    Used for polling-based chart updates when WebSocket is not enough.
+    """
+    try:
+        samples = influx_helper.query_recent_samples(
+            start_relative=start_relative,
+            limit=limit
+        )
+        return {"count": len(samples), "data": samples}
+    except Exception as e:
+        logger.error(f"Failed to get recent samples: {e}")
+        raise HTTPException(
+            status_code=502,
+            detail=f"InfluxDB query failed: {str(e)}"
+        )
+
+
 @router.get("/metrics/fields")
 async def get_fields():
     """

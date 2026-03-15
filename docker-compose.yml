@@ -92,7 +92,7 @@ services:
     environment:
       KAFKA_BROKER: kafka:9092
       KAFKA_ENABLED: "true"
-      SAMPLE_INTERVAL_MS: 150
+      SAMPLE_INTERVAL_MS: 1000
       RUN_SECONDS: 300
     command: python -m mlviz.workloads.resnet_main
     networks:
@@ -109,7 +109,7 @@ services:
     environment:
       KAFKA_BROKER: kafka:9092
       KAFKA_ENABLED: "true"
-      SAMPLE_INTERVAL_MS: 150
+      SAMPLE_INTERVAL_MS: 1000
       RUN_SECONDS: 300
     command: python -m mlviz.workloads.bert_main
     networks:
@@ -126,7 +126,7 @@ services:
     environment:
       KAFKA_BROKER: kafka:9092
       KAFKA_ENABLED: "true"
-      SAMPLE_INTERVAL_MS: 150
+      SAMPLE_INTERVAL_MS: 1000
       RUN_SECONDS: 300
     command: python -m mlviz.workloads.pipeline_main
     networks:
