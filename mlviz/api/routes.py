@@ -14,6 +14,11 @@ from pydantic import BaseModel, Field
 
 from .influx import influx_helper
 from .slack_notifier import slack_notifier
+from .optimizer_diagnostics import (
+    analyze_phase_correlation,
+    compute_interference_score,
+    compute_weighted_baseline,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -58,6 +63,7 @@ class OptimizerAnalysisRequest(BaseModel):
     active_alerts: List[AlertSummary] = Field(default_factory=list)
     time_window_ms: Optional[int] = None
     operator_note: Optional[str] = None
+    fingerprints: Optional[List[dict]] = Field(default=None)
 
 
 class OptimizerFixCommand(BaseModel):
@@ -70,6 +76,26 @@ class OptimizerFixCommand(BaseModel):
     estimated_impact: Optional[str] = None
 
 
+class PhaseCorrelationItem(BaseModel):
+    """Phase correlation finding."""
+    victim_model: str
+    cause_model: str
+    cause_phase: str
+    spike_ratio: float
+
+
+class InterferenceScoreItem(BaseModel):
+    """Per-model interference score."""
+    model_id: str
+    score: float
+    llc_degradation: float
+    throughput_degradation: float
+    baseline_llc: Optional[float] = None
+    baseline_throughput: Optional[float] = None
+    current_llc: float
+    current_throughput: float
+
+
 class OptimizerAnalysisResponse(BaseModel):
     """Response payload for optimizer analysis."""
     severity: str
@@ -79,6 +105,8 @@ class OptimizerAnalysisResponse(BaseModel):
     analysis_id: Optional[str] = None
     model_version: Optional[str] = None
     latency_ms: Optional[int] = None
+    interference_scores: Optional[List[InterferenceScoreItem]] = None
+    phase_correlations: Optional[List[PhaseCorrelationItem]] = None
 
 
 @router.get("/metrics/raw")
@@ -498,40 +526,77 @@ async def analyze_optimizer(request: OptimizerAnalysisRequest) -> OptimizerAnaly
             elapsed_ms = int((time.time() - start_time) * 1000)
             return _fallback_response(elapsed_ms, "missing GEMINI_API_KEY")
 
-        # Summarized + raw metric snippets for strict SRE prompting.
-        recent_samples = influx_helper.query_recent_samples(start_relative="-2m", limit=2000)
+        samples_60s = influx_helper.query_recent_samples(start_relative="-60s", limit=50000)
+        
+        fingerprints_dict = {}
+        if request.fingerprints:
+            for fp in request.fingerprints:
+                if fp.get("model_id"):
+                    fingerprints_dict[fp["model_id"]] = fp
+        
+        phase_correlations = analyze_phase_correlation(samples_60s, fingerprints_dict)
+        
         model_metrics = {}
-        for sample in recent_samples:
+        for sample in samples_60s:
             model_id = sample.get("model_id", "unknown")
             model_metrics.setdefault(model_id, []).append(sample)
-
-        summarized_metrics = []
-        for model_id, samples in list(model_metrics.items())[:5]:
-            if not samples:
-                continue
-            cpu_avg = sum(float(s.get("cpu_percent", 0.0)) for s in samples) / len(samples)
-            ram_avg = sum(float(s.get("ram_mb", 0.0)) for s in samples) / len(samples)
-            llc_avg = sum(float(s.get("llc_miss_rate", 0.0)) for s in samples) / len(samples)
-            thr_avg = sum(float(s.get("throughput", 0.0)) for s in samples) / len(samples)
-            summarized_metrics.append(
-                {
-                    "model_id": model_id,
-                    "samples": len(samples),
-                    "cpu_percent_avg": round(cpu_avg, 3),
-                    "ram_mb_avg": round(ram_avg, 3),
-                    "llc_miss_rate_avg": round(llc_avg, 4),
-                    "throughput_avg": round(thr_avg, 3),
+        
+        interference_scores = []
+        for model_id, samples in model_metrics.items():
+            fp = fingerprints_dict.get(model_id)
+            score_result = compute_interference_score(model_id, samples, fp)
+            interference_scores.append(score_result)
+        
+        fingerprint_baselines = {}
+        for model_id, fp in fingerprints_dict.items():
+            llc_base, thr_base = compute_weighted_baseline(fp)
+            phases_list = list(fp.get("phases", {}).keys())
+            fingerprint_baselines[model_id] = {
+                "llc_baseline": round(llc_base, 4) if llc_base is not None else None,
+                "throughput_baseline": round(thr_base, 2) if thr_base is not None else None,
+                "phases": phases_list,
+                "sample_count": fp.get("sample_count", 0),
+            }
+        
+        current_concurrent = {}
+        deltas = {}
+        for model_id, samples in model_metrics.items():
+            valid_llc = [s["llc_miss_rate"] for s in samples if s.get("llc_miss_rate", -1) >= 0]
+            valid_thr = [s["throughput"] for s in samples if s.get("throughput", -1) >= 0]
+            valid_cpu = [s["cpu_percent"] for s in samples if s.get("cpu_percent", 0) >= 0]
+            valid_ram = [s["ram_mb"] for s in samples if s.get("ram_mb", 0) >= 0]
+            
+            llc_curr = sum(valid_llc) / len(valid_llc) if valid_llc else 0.0
+            thr_curr = sum(valid_thr) / len(valid_thr) if valid_thr else -1.0
+            cpu_curr = sum(valid_cpu) / len(valid_cpu) if valid_cpu else 0.0
+            ram_curr = sum(valid_ram) / len(valid_ram) if valid_ram else 0.0
+            
+            current_concurrent[model_id] = {
+                "llc_miss_rate": round(llc_curr, 4),
+                "throughput": round(thr_curr, 2),
+                "cpu_percent": round(cpu_curr, 2),
+                "ram_mb": round(ram_curr, 2),
+                "sample_count": len(samples),
+            }
+            
+            if model_id in fingerprint_baselines:
+                baseline = fingerprint_baselines[model_id]
+                llc_base = baseline["llc_baseline"]
+                thr_base = baseline["throughput_baseline"]
+                
+                deltas[model_id] = {
+                    "llc_delta": round(llc_curr - llc_base, 4) if llc_base is not None else None,
+                    "throughput_delta": round(thr_curr - thr_base, 2) if thr_base is not None and thr_curr > 0 else None,
                 }
-            )
-
-        raw_snippets = recent_samples[-12:] if len(recent_samples) > 12 else recent_samples
 
         prompt_payload = {
             "active_alerts": [a.model_dump() for a in request.active_alerts],
             "time_window_ms": request.time_window_ms,
             "operator_note": request.operator_note,
-            "metrics_summary": summarized_metrics,
-            "metrics_raw_snippets": raw_snippets,
+            "fingerprint_baselines_per_model": fingerprint_baselines,
+            "current_concurrent_per_model": current_concurrent,
+            "deltas": deltas,
+            "phase_correlation_findings": [c.to_dict() for c in phase_correlations[:10]],
             "policy": {
                 "tone": "strict SRE",
                 "commands": "advisory only",
@@ -557,12 +622,15 @@ async def analyze_optimizer(request: OptimizerAnalysisRequest) -> OptimizerAnaly
         system_instruction = (
             "You are a strict SRE optimizer engine. Return ONLY valid JSON with keys: "
             "severity, issue_headline, root_cause_analysis, recommended_fixes. "
-            "Keep commands advisory-only (do not claim execution happened). "
-            "Use concrete technical language tied to provided metrics."
+            "Use ONLY the supplied structured evidence: fingerprint_baselines_per_model, "
+            "current_concurrent_per_model, deltas, and phase_correlation_findings. "
+            "Cite phase_correlation_findings and deltas when explaining mechanism. "
+            "Do not invent models or phases not present in the evidence. "
+            "Keep commands advisory-only (do not claim execution happened)."
         )
 
         user_instruction = (
-            "Analyze this telemetry payload and produce remediation advice.\n"
+            "Analyze this structured telemetry evidence and produce remediation advice.\n"
             f"{json.dumps(prompt_payload, separators=(',', ':'))}"
         )
 
@@ -641,6 +709,12 @@ async def analyze_optimizer(request: OptimizerAnalysisRequest) -> OptimizerAnaly
             analysis_id=f"analysis-{uuid.uuid4().hex[:12]}",
             model_version="gemini-flash-latest",
             latency_ms=elapsed_ms,
+            interference_scores=[
+                InterferenceScoreItem(**score.to_dict()) for score in interference_scores
+            ],
+            phase_correlations=[
+                PhaseCorrelationItem(**corr.to_dict()) for corr in phase_correlations[:10]
+            ],
         )
 
         slack_sent, slack_reason = slack_notifier.send_optimizer_analysis_complete(
