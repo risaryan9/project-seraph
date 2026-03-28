@@ -4,7 +4,7 @@ import logging
 import os
 import time
 import threading
-from typing import Optional
+from typing import List, Optional
 import urllib.request
 import json
 
@@ -17,6 +17,7 @@ class SlackNotifier:
     def __init__(self, webhook_url: Optional[str] = None):
         self.webhook_url = webhook_url or os.getenv("SLACK_WEBHOOK_URL")
         self.enabled = bool(self.webhook_url)
+        self.optimizer_webhook_url = os.getenv("SLACK_OPTIMIZER_WEBHOOK_URL", "").strip() or None
         self.debounce_seconds = 20
         self.last_sent_ts = 0.0
         self._send_lock = threading.Lock()
@@ -25,6 +26,8 @@ class SlackNotifier:
             logger.warning("Slack notifications disabled: SLACK_WEBHOOK_URL not set")
         else:
             logger.info("Slack notifier initialized")
+        if self.optimizer_webhook_url:
+            logger.info("Slack optimizer webhook configured (SLACK_OPTIMIZER_WEBHOOK_URL)")
     
     def _format_metric_value(self, metric: str, value: float) -> str:
         """Format metric value for display."""
@@ -117,6 +120,152 @@ class SlackNotifier:
                 ]
             }
         ]
+    
+    @staticmethod
+    def _escape_mrkdwn(text: str) -> str:
+        return (
+            text.replace("&", "&amp;")
+            .replace("<", "&lt;")
+            .replace(">", "&gt;")
+        )
+    
+    def _optimizer_severity_emoji(self, severity: str) -> str:
+        return {
+            "critical": "🔴",
+            "high": "🟠",
+            "medium": "🟡",
+            "low": "🟢",
+        }.get(severity.lower(), "⚪")
+    
+    def _build_optimizer_blocks(
+        self,
+        severity: str,
+        issue_headline: str,
+        root_cause_analysis: str,
+        fix_titles: List[str],
+        analysis_id: str,
+        model_version: str,
+        latency_ms: int,
+        dashboard_url: str,
+    ) -> list:
+        emoji = self._optimizer_severity_emoji(severity)
+        sev = severity.upper()
+        headline = self._escape_mrkdwn(issue_headline.strip())[:500]
+        root = self._escape_mrkdwn(root_cause_analysis.strip())
+        if len(root) > 2400:
+            root = root[:2399] + "…"
+        fix_lines = []
+        for i, title in enumerate(fix_titles[:6]):
+            t = self._escape_mrkdwn(title.strip())[:200]
+            fix_lines.append(f"{i + 1}. {t}")
+        fixes_text = "\n".join(fix_lines) if fix_lines else "_No remediation cards_"
+        return [
+            {
+                "type": "header",
+                "text": {
+                    "type": "plain_text",
+                    "text": f"{emoji} Seraph Optimizer — analysis complete",
+                    "emoji": True,
+                },
+            },
+            {
+                "type": "section",
+                "fields": [
+                    {"type": "mrkdwn", "text": f"*Severity*\n{sev}"},
+                    {"type": "mrkdwn", "text": f"*Latency*\n{latency_ms} ms"},
+                    {"type": "mrkdwn", "text": f"*Model*\n`{self._escape_mrkdwn(model_version)}`"},
+                    {"type": "mrkdwn", "text": f"*Analysis ID*\n`{self._escape_mrkdwn(analysis_id)}`"},
+                ],
+            },
+            {"type": "divider"},
+            {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": f"*Issue*\n{headline}",
+                },
+            },
+            {
+                "type": "section",
+                "text": {"type": "mrkdwn", "text": f"*Root cause*\n{root}"},
+            },
+            {"type": "divider"},
+            {
+                "type": "section",
+                "text": {"type": "mrkdwn", "text": f"*Recommended fixes*\n{fixes_text}"},
+            },
+            {
+                "type": "context",
+                "elements": [
+                    {
+                        "type": "mrkdwn",
+                        "text": f"_Completed {time.strftime('%Y-%m-%d %H:%M:%S')} UTC_",
+                    }
+                ],
+            },
+            {
+                "type": "actions",
+                "elements": [
+                    {
+                        "type": "button",
+                        "text": {
+                            "type": "plain_text",
+                            "text": "Open Alerts & Optimizer",
+                            "emoji": True,
+                        },
+                        "url": dashboard_url,
+                        "style": "primary",
+                    }
+                ],
+            },
+        ]
+    
+    def send_optimizer_analysis_complete(
+        self,
+        severity: str,
+        issue_headline: str,
+        root_cause_analysis: str,
+        recommended_fix_titles: List[str],
+        analysis_id: str,
+        model_version: str,
+        latency_ms: int,
+        dashboard_url: str = "http://localhost:3000/alerts",
+    ) -> tuple[bool, str]:
+        """
+        Post successful optimizer analysis to SLACK_OPTIMIZER_WEBHOOK_URL.
+        Does not use the alert debounce.
+        """
+        if not self.optimizer_webhook_url:
+            logger.debug("Slack optimizer webhook not set, skipping")
+            return False, "webhook_not_configured"
+        try:
+            blocks = self._build_optimizer_blocks(
+                severity=severity,
+                issue_headline=issue_headline,
+                root_cause_analysis=root_cause_analysis,
+                fix_titles=recommended_fix_titles,
+                analysis_id=analysis_id,
+                model_version=model_version,
+                latency_ms=latency_ms,
+                dashboard_url=dashboard_url,
+            )
+            plain = f"[{severity.upper()}] {issue_headline[:200]}"
+            payload = {"blocks": blocks, "text": plain}
+            req = urllib.request.Request(
+                self.optimizer_webhook_url,
+                data=json.dumps(payload).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=10) as response:
+                if response.status == 200:
+                    logger.info("Slack optimizer notification sent (%s)", analysis_id)
+                    return True, "ok"
+                logger.error("Slack optimizer webhook returned status %s", response.status)
+                return False, "slack_http_error"
+        except Exception as e:
+            logger.error("Slack optimizer notification failed: %s", e)
+            return False, "slack_exception"
     
     def send_alert(
         self,

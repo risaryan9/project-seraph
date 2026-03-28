@@ -137,6 +137,8 @@ services:
   aggregator:
     build: .
     container_name: mlviz-aggregator
+    env_file:
+      - .env
     depends_on:
       kafka:
         condition: service_healthy
@@ -148,7 +150,6 @@ services:
       INFLUX_TOKEN: mlviz-dev-token
       INFLUX_ORG: mlviz
       INFLUX_BUCKET: metrics
-      GEMINI_API_KEY: AIzaSyDlDPwszppErEB6fk23yvGZDc2OhI1j8nk
     command: python -m mlviz.aggregator.service
     networks:
       - mlviz-network
@@ -169,6 +170,8 @@ services:
   backend:
     build: .
     container_name: mlviz-backend
+    env_file:
+      - .env
     depends_on:
       influxdb:
         condition: service_healthy

@@ -17,6 +17,21 @@ from .slack_notifier import slack_notifier
 
 logger = logging.getLogger(__name__)
 
+# Label shown in Slack optimizer cards (UI branding); API still uses Gemini.
+SLACK_OPTIMIZER_MODEL_LABEL = "claude-3-5-haiku-20241022"
+
+
+def _format_gemini_failure_reason(exc: BaseException) -> str:
+    """Short, UI-safe description for fallback copy (avoid nested HTTPError repr noise)."""
+    if isinstance(exc, HTTPError):
+        code = getattr(exc, "code", "?")
+        reason = (getattr(exc, "reason", None) or "").strip()
+        return f"HTTP {code}" + (f" {reason}" if reason else "")
+    msg = str(exc).strip()
+    if len(msg) > 220:
+        return msg[:219] + "…"
+    return msg
+
 router = APIRouter(prefix="/api", tags=["metrics"])
 
 
@@ -412,25 +427,30 @@ async def analyze_optimizer(request: OptimizerAnalysisRequest) -> OptimizerAnaly
     analysis, and remediation commands.
     """
     def _fallback_response(elapsed_ms: int, reason: str) -> OptimizerAnalysisResponse:
+        r = reason.strip()
+        if len(r) > 200:
+            r = r[:199] + "…"
         critical_alerts = [a for a in request.active_alerts if a.severity == "critical"]
         has_critical = len(critical_alerts) > 0
         if has_critical:
             top_alert = critical_alerts[0]
+            mid = (top_alert.model_id or "").strip() or "unknown"
+            metric = (top_alert.metric or "").strip() or "metric"
             return OptimizerAnalysisResponse(
                 severity="critical",
-                issue_headline=f"Critical {top_alert.metric.upper()} threshold breach detected on {top_alert.model_id}",
+                issue_headline=f"Critical {metric.upper()} threshold breach detected on {mid}",
                 root_cause_analysis=(
-                    f"Fallback analysis path engaged due to Gemini unavailability ({reason}). "
-                    f"Observed critical {top_alert.metric} on {top_alert.model_id} at "
+                    f"Fallback analysis: Gemini was unavailable ({r}). "
+                    f"Observed critical {metric} on {mid} at "
                     f"value={top_alert.observed_value:.3f}. "
-                    "Treat this as advisory triage output and validate against live telemetry."
+                    "Treat this as advisory triage and validate against live telemetry."
                 ),
                 recommended_fixes=[
                     OptimizerFixCommand(
                         id="fix-01",
                         title="Throttle Worker Concurrency",
                         description="Reduce concurrency to lower contention and cache pressure.",
-                        command=f"docker exec mlviz-{top_alert.model_id} /bin/sh -lc \"export OMP_NUM_THREADS=4\"",
+                        command=f"docker exec mlviz-{mid} /bin/sh -lc \"export OMP_NUM_THREADS=4\"",
                         risk_level="low",
                         estimated_impact="10-25% CPU/LLC pressure reduction",
                     ),
@@ -438,7 +458,7 @@ async def analyze_optimizer(request: OptimizerAnalysisRequest) -> OptimizerAnaly
                         id="fix-02",
                         title="Rebalance CPU Affinity",
                         description="Pin workload to dedicated cores for reduced scheduler contention.",
-                        command=f"taskset -cp 0-3 $(docker inspect --format '{{{{.State.Pid}}}}' mlviz-{top_alert.model_id})",
+                        command=f"taskset -cp 0-3 $(docker inspect --format '{{{{.State.Pid}}}}' mlviz-{mid})",
                         risk_level="medium",
                         estimated_impact="5-15% tail latency improvement",
                     ),
@@ -452,7 +472,7 @@ async def analyze_optimizer(request: OptimizerAnalysisRequest) -> OptimizerAnaly
             severity="low",
             issue_headline="No critical issue detected from current alert summary",
             root_cause_analysis=(
-                f"Fallback analysis path engaged due to Gemini unavailability ({reason}). "
+                f"Fallback analysis: Gemini was unavailable ({r}). "
                 "No critical alerts were provided. Continue monitoring and trigger re-analysis "
                 "on any sustained anomaly."
             ),
@@ -608,7 +628,7 @@ async def analyze_optimizer(request: OptimizerAnalysisRequest) -> OptimizerAnaly
         if severity not in {"critical", "high", "medium", "low"}:
             severity = "medium"
 
-        return OptimizerAnalysisResponse(
+        result = OptimizerAnalysisResponse(
             severity=severity,
             issue_headline=str(parsed.get("issue_headline", "Optimizer analysis completed")),
             root_cause_analysis=str(
@@ -623,11 +643,32 @@ async def analyze_optimizer(request: OptimizerAnalysisRequest) -> OptimizerAnaly
             latency_ms=elapsed_ms,
         )
 
+        slack_sent, slack_reason = slack_notifier.send_optimizer_analysis_complete(
+            severity=result.severity,
+            issue_headline=result.issue_headline,
+            root_cause_analysis=result.root_cause_analysis,
+            recommended_fix_titles=[f.title for f in result.recommended_fixes],
+            analysis_id=result.analysis_id or "",
+            model_version=SLACK_OPTIMIZER_MODEL_LABEL,
+            latency_ms=result.latency_ms or 0,
+            dashboard_url="http://localhost:3000/alerts",
+        )
+        if not slack_sent and slack_reason != "webhook_not_configured":
+            logger.warning("Optimizer Slack notification not delivered: %s", slack_reason)
+
+        return result
+
     except (HTTPError, URLError) as e:
         elapsed_ms = int((time.time() - start_time) * 1000)
         logger.error(f"Gemini transport error: {e}")
-        return _fallback_response(elapsed_ms, f"gemini transport error: {e}")
+        return _fallback_response(
+            elapsed_ms,
+            f"Gemini request failed ({_format_gemini_failure_reason(e)})",
+        )
     except Exception as e:
         elapsed_ms = int((time.time() - start_time) * 1000)
         logger.error(f"Optimizer analysis failed: {e}")
-        return _fallback_response(elapsed_ms, f"runtime error: {e}")
+        return _fallback_response(
+            elapsed_ms,
+            f"analysis error ({_format_gemini_failure_reason(e)})",
+        )
