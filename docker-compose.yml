@@ -148,6 +148,7 @@ services:
       INFLUX_TOKEN: mlviz-dev-token
       INFLUX_ORG: mlviz
       INFLUX_BUCKET: metrics
+      GEMINI_API_KEY: AIzaSyDlDPwszppErEB6fk23yvGZDc2OhI1j8nk
     command: python -m mlviz.aggregator.service
     networks:
       - mlviz-network

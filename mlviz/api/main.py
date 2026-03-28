@@ -8,6 +8,10 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
+from dotenv import load_dotenv
+
+# Ensure .env is loaded before importing router/notifier modules.
+load_dotenv()
 
 from .influx import influx_helper
 from .routes import router
