@@ -5,7 +5,7 @@ import logging
 import os
 import time
 import uuid
-from typing import List, Optional
+from typing import Dict, List, Optional
 from urllib.error import URLError, HTTPError
 from urllib.request import Request, urlopen
 
@@ -18,6 +18,11 @@ from .optimizer_diagnostics import (
     analyze_phase_correlation,
     compute_interference_score,
     compute_weighted_baseline,
+)
+from .model_process_pids import (
+    format_pid_lines_for_prompt,
+    remediation_command_rules_text,
+    resolve_process_identifiers,
 )
 
 logger = logging.getLogger(__name__)
@@ -74,6 +79,9 @@ class OptimizerFixCommand(BaseModel):
     command: str
     risk_level: Optional[str] = None
     estimated_impact: Optional[str] = None
+    evidence: Optional[str] = None
+    mechanism: Optional[str] = None
+    expected_outcome: Optional[str] = None
 
 
 class PhaseCorrelationItem(BaseModel):
@@ -454,6 +462,34 @@ async def analyze_optimizer(request: OptimizerAnalysisRequest) -> OptimizerAnaly
     Returns structured recommendations with severity assessment, root cause
     analysis, and remediation commands.
     """
+    alert_model_ids = {
+        (a.model_id or "").strip()
+        for a in request.active_alerts
+        if a.model_id and str(a.model_id).strip()
+    }
+    pid_context = resolve_process_identifiers(alert_model_ids)
+
+    def _affinity_command(model_id: str) -> str:
+        info = pid_context.get(model_id) or {}
+        hp = info.get("host_pid")
+        dc = info.get("docker_container") or f"mlviz-{model_id}"
+        icp = int(info.get("in_container_pid") or 1)
+        if isinstance(hp, int) and hp > 0:
+            return f"taskset -cp 0-3 {hp}"
+        return f"docker exec {dc} taskset -cp 0-3 {icp}"
+
+    def _renice_command(model_id: str, nice: int = 10) -> str:
+        info = pid_context.get(model_id) or {}
+        hp = info.get("host_pid")
+        dc = info.get("docker_container") or f"mlviz-{model_id}"
+        icp = int(info.get("in_container_pid") or 1)
+        if isinstance(hp, int) and hp > 0:
+            return f"renice -n {nice} -p {hp}"
+        return f"docker exec {dc} renice -n {nice} -p {icp}"
+
+    def _docker_container(model_id: str) -> str:
+        return (pid_context.get(model_id) or {}).get("docker_container") or f"mlviz-{model_id}"
+
     def _fallback_response(elapsed_ms: int, reason: str) -> OptimizerAnalysisResponse:
         r = reason.strip()
         if len(r) > 200:
@@ -464,6 +500,7 @@ async def analyze_optimizer(request: OptimizerAnalysisRequest) -> OptimizerAnaly
             top_alert = critical_alerts[0]
             mid = (top_alert.model_id or "").strip() or "unknown"
             metric = (top_alert.metric or "").strip() or "metric"
+            dc = _docker_container(mid)
             return OptimizerAnalysisResponse(
                 severity="critical",
                 issue_headline=f"Critical {metric.upper()} threshold breach detected on {mid}",
@@ -476,19 +513,66 @@ async def analyze_optimizer(request: OptimizerAnalysisRequest) -> OptimizerAnaly
                 recommended_fixes=[
                     OptimizerFixCommand(
                         id="fix-01",
-                        title="Throttle Worker Concurrency",
-                        description="Reduce concurrency to lower contention and cache pressure.",
-                        command=f"docker exec mlviz-{mid} /bin/sh -lc \"export OMP_NUM_THREADS=4\"",
+                        title="Throttle OMP threads (container)",
+                        description="Run a one-off Python entry with reduced OMP threads inside the model container.",
+                        command=(
+                            f"docker exec -e OMP_NUM_THREADS=4 -e MKL_NUM_THREADS=4 "
+                            f"{dc} python -c \"import os; print('OMP_NUM_THREADS', os.environ.get('OMP_NUM_THREADS'))\""
+                        ),
                         risk_level="low",
-                        estimated_impact="10-25% CPU/LLC pressure reduction",
+                        estimated_impact="10-25% CPU/LLC pressure reduction (set in process env for real runs)",
+                        evidence=(
+                            f"Active critical alert: {metric} on {mid} at "
+                            f"{top_alert.observed_value:.3f} vs threshold (fallback; no live correlation block)."
+                        ),
+                        mechanism=(
+                            "OpenMP/MKL thread oversubscription increases runnable threads and LLC pressure "
+                            "on the same package as concurrent models."
+                        ),
+                        expected_outcome=(
+                            f"CPU and context-switch load on {mid} should fall after restarting the workload "
+                            f"with OMP_NUM_THREADS=4; LLC miss rate often drops modestly once core occupancy stabilizes."
+                        ),
                     ),
                     OptimizerFixCommand(
                         id="fix-02",
-                        title="Rebalance CPU Affinity",
-                        description="Pin workload to dedicated cores for reduced scheduler contention.",
-                        command=f"taskset -cp 0-3 $(docker inspect --format '{{{{.State.Pid}}}}' mlviz-{mid})",
+                        title="Rebalance CPU affinity",
+                        description="Pin the workload to CPUs 0-3 using taskset (host PID if known, else PID 1 in container).",
+                        command=_affinity_command(mid),
                         risk_level="medium",
                         estimated_impact="5-15% tail latency improvement",
+                        evidence=(
+                            f"Contention-driven {metric} spike on {mid}; isolating cores reduces cross-workload "
+                            "scheduler migration and cache interference."
+                        ),
+                        mechanism=(
+                            "taskset restricts which logical CPUs run the process, improving LLC residency "
+                            "for hot loops versus bouncing across the full socket."
+                        ),
+                        expected_outcome=(
+                            "Tail latency and LLC miss rate on the pinned workload typically improve when "
+                            "neighbor jobs are kept off the same core set (validate with 30s post-apply window)."
+                        ),
+                    ),
+                    OptimizerFixCommand(
+                        id="fix-03",
+                        title="Lower scheduling priority",
+                        description="Reduce nice value for the workload process.",
+                        command=_renice_command(mid, 10),
+                        risk_level="low",
+                        estimated_impact="Yields CPU to higher-priority work on the same host/cgroup",
+                        evidence=(
+                            f"Critical {metric} on {mid} suggests this process is winning too much CPU time "
+                            "relative to co-located workloads."
+                        ),
+                        mechanism=(
+                            "renice increases dynamic priority of other runnable tasks, reducing time-slice "
+                            "dominance without hard affinity changes."
+                        ),
+                        expected_outcome=(
+                            f"Peer models should see slightly higher effective CPU share; {mid} throughput "
+                            "may dip slightly while system-wide p95 improves."
+                        ),
                     ),
                 ],
                 analysis_id=f"analysis-fallback-{uuid.uuid4().hex[:12]}",
@@ -512,6 +596,9 @@ async def analyze_optimizer(request: OptimizerAnalysisRequest) -> OptimizerAnaly
                     command="curl -X POST http://localhost:8000/api/optimizer/analysis -H 'Content-Type: application/json' -d '{}'",
                     risk_level="low",
                     estimated_impact="Improved diagnostic confidence",
+                    evidence="No critical alerts in this request; evidence window is empty.",
+                    mechanism="Additional samples improve phase correlation and baseline delta confidence.",
+                    expected_outcome="Subsequent run may populate evidence, mechanism, and measured deltas per fix.",
                 )
             ],
             analysis_id=f"analysis-fallback-{uuid.uuid4().hex[:12]}",
@@ -589,10 +676,31 @@ async def analyze_optimizer(request: OptimizerAnalysisRequest) -> OptimizerAnaly
                     "throughput_delta": round(thr_curr - thr_base, 2) if thr_base is not None and thr_curr > 0 else None,
                 }
 
+        all_model_ids = (
+            set(model_metrics.keys())
+            | alert_model_ids
+            | set(fingerprints_dict.keys())
+        )
+        pid_context = resolve_process_identifiers(all_model_ids)
+
+        def _pid_context_json_safe(ctx: Dict[str, dict]) -> Dict[str, dict]:
+            out: Dict[str, dict] = {}
+            for mid, row in ctx.items():
+                hp = row.get("host_pid")
+                out[mid] = {
+                    "host_pid": hp if isinstance(hp, int) and hp > 0 else None,
+                    "docker_container": row.get("docker_container"),
+                    "in_container_pid": int(row.get("in_container_pid") or 1),
+                }
+            return out
+
         prompt_payload = {
             "active_alerts": [a.model_dump() for a in request.active_alerts],
             "time_window_ms": request.time_window_ms,
             "operator_note": request.operator_note,
+            "process_identifiers": _pid_context_json_safe(pid_context),
+            "process_identifier_lines": format_pid_lines_for_prompt(pid_context),
+            "remediation_command_rules": remediation_command_rules_text(),
             "fingerprint_baselines_per_model": fingerprint_baselines,
             "current_concurrent_per_model": current_concurrent,
             "deltas": deltas,
@@ -614,6 +722,9 @@ async def analyze_optimizer(request: OptimizerAnalysisRequest) -> OptimizerAnaly
                         "command": "string",
                         "risk_level": "low|medium|high",
                         "estimated_impact": "string",
+                        "evidence": "2-4 lines: cite current vs baseline metrics, spike_ratio or correlation from phase_correlation_findings",
+                        "mechanism": "2-4 lines: hardware/OS explanation tied to evidence",
+                        "expected_outcome": "2-4 lines: predicted LLC/throughput/CPU deltas using numbers from current_concurrent and baselines",
                     }
                 ],
             },
@@ -622,8 +733,16 @@ async def analyze_optimizer(request: OptimizerAnalysisRequest) -> OptimizerAnaly
         system_instruction = (
             "You are a strict SRE optimizer engine. Return ONLY valid JSON with keys: "
             "severity, issue_headline, root_cause_analysis, recommended_fixes. "
-            "Use ONLY the supplied structured evidence: fingerprint_baselines_per_model, "
+            "Use ONLY the supplied structured evidence: process_identifiers, "
+            "process_identifier_lines, fingerprint_baselines_per_model, "
             "current_concurrent_per_model, deltas, and phase_correlation_findings. "
+            "Follow remediation_command_rules exactly for recommended_fixes[].command: "
+            "use literal numeric PIDs from process_identifiers only — never $(pgrep), "
+            "never docker inspect for PID discovery, never subshells. "
+            "Each recommended_fixes[] entry MUST include evidence, mechanism, and expected_outcome: "
+            "evidence ties the fix to specific metrics and phase_correlation_findings; "
+            "mechanism explains cache/CPU/scheduling causality; "
+            "expected_outcome gives concrete before→after style predictions using evidence numbers. "
             "Cite phase_correlation_findings and deltas when explaining mechanism. "
             "Do not invent models or phases not present in the evidence. "
             "Keep commands advisory-only (do not claim execution happened)."
@@ -668,15 +787,25 @@ async def analyze_optimizer(request: OptimizerAnalysisRequest) -> OptimizerAnaly
             raise ValueError("Gemini returned empty response text")
 
         parsed = json.loads(text_out)
-        fixes = [
-            OptimizerFixCommand(
+        def _fix_from_dict(fx: dict, idx: int) -> OptimizerFixCommand:
+            def _txt(key: str, default: str = "") -> Optional[str]:
+                s = str(fx.get(key, default) or "").strip()
+                return s or None
+
+            return OptimizerFixCommand(
                 id=str(fx.get("id", f"fix-{idx+1:02d}")),
                 title=str(fx.get("title", "Untitled Fix")),
                 description=str(fx.get("description", "No description provided")),
                 command=str(fx.get("command", "# advisory command unavailable")),
                 risk_level=str(fx.get("risk_level", "medium")).lower(),
-                estimated_impact=str(fx.get("estimated_impact", "")) or None,
+                estimated_impact=_txt("estimated_impact"),
+                evidence=_txt("evidence"),
+                mechanism=_txt("mechanism"),
+                expected_outcome=_txt("expected_outcome"),
             )
+
+        fixes = [
+            _fix_from_dict(fx, idx)
             for idx, fx in enumerate(parsed.get("recommended_fixes", []))
         ]
         if not fixes:
@@ -688,6 +817,9 @@ async def analyze_optimizer(request: OptimizerAnalysisRequest) -> OptimizerAnaly
                     command="curl -X POST http://localhost:8000/api/optimizer/analysis -H 'Content-Type: application/json' -d '{}'",
                     risk_level="low",
                     estimated_impact="Improves diagnostic completeness",
+                    evidence="No automated fix cards were returned in this response.",
+                    mechanism="Re-run analysis after confirming telemetry and GEMINI_API_KEY.",
+                    expected_outcome="Further analysis may yield actionable remediation steps.",
                 )
             ]
 
